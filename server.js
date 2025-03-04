@@ -1,58 +1,94 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import path from 'node:path'
 import express from 'express'
-import { createServer as createViteServer } from 'vite'
+import getPort, { portNumbers } from 'get-port'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const isTest = process.env.NODE_ENV === 'test' || !!process.env.VITE_TEST_BUILD
 
-async function createServer() {
+export async function createServer(
+  root = process.cwd(),
+  isProd = process.env.NODE_ENV === 'production',
+  hmrPort,
+) {
   const app = express()
 
-  // 创建 Vite 服务器
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: 'custom'
-  })
-
-  // 使用 vite 的中间件
-  app.use(vite.middlewares)
+  /**
+   * @type {import('vite').ViteDevServer}
+   */
+  let vite
+  if (!isProd) {
+    vite = await (
+      await import('vite')
+    ).createServer({
+      root,
+      logLevel: isTest ? 'error' : 'info',
+      server: {
+        middlewareMode: true,
+        watch: {
+          // During tests we edit the files too fast and sometimes chokidar
+          // misses change events, so enforce polling for consistency
+          usePolling: true,
+          interval: 100,
+        },
+        hmr: {
+          port: hmrPort,
+        },
+      },
+      appType: 'custom',
+    })
+    // use vite's connect instance as middleware
+    app.use(vite.middlewares)
+  } else {
+    app.use((await import('compression')).default())
+  }
 
   app.use('*', async (req, res) => {
-    const url = req.originalUrl
-
     try {
-      // 1. 读取 index.html
-      let template = fs.readFileSync(
-        path.resolve(__dirname, 'index.html'),
-        'utf-8'
+      const url = req.originalUrl
+
+      if (path.extname(url) !== '') {
+        console.warn(`${url} is not valid router path`)
+        res.status(404)
+        res.end(`${url} is not valid router path`)
+        return
+      }
+
+      // Best effort extraction of the head from vite's index transformation hook
+      let viteHead = !isProd
+        ? await vite.transformIndexHtml(
+            url,
+            `<html><head></head><body></body></html>`,
+          )
+        : ''
+
+      viteHead = viteHead.substring(
+        viteHead.indexOf('<head>') + 6,
+        viteHead.indexOf('</head>'),
       )
 
-      // 2. 应用 Vite HTML 转换
-      template = await vite.transformIndexHtml(url, template)
+      const entry = await (async () => {
+        if (!isProd) {
+          return vite.ssrLoadModule('/src/entry.server.tsx')
+        } else {
+          return import('./dist/server/entry.server.js')
+        }
+      })()
 
-      // 3. 加载服务器入口
-      const { render } = await vite.ssrLoadModule('/src/entry.server.tsx')
-
-      // 4. 渲染应用的 HTML，传递当前 URL
-      const result = await render(url)
-
-      // 5. 注入渲染后的应用 HTML 到模板中
-      const html = template.replace(`<div id="root"></div>`, `<div id="root">${result.html}</div>`)
-
-      // 6. 发送渲染后的 HTML
-      res.status(result.statusCode).set({ 'Content-Type': 'text/html' }).end(html)
+      console.info('Rendering: ', url, '...')
+      entry.render({ req, res, head: viteHead })
     } catch (e) {
-      // 如果捕获到了错误，让 Vite 修复堆栈跟踪
-      vite.ssrFixStacktrace(e)
-      console.error(e)
-      res.status(500).end(e.message)
+      !isProd && vite.ssrFixStacktrace(e)
+      console.info(e.stack)
+      res.status(500).end(e.stack)
     }
   })
 
-  app.listen(3000, () => {
-    console.log('服务器运行在 http://localhost:3000')
-  })
+  return { app, vite }
 }
 
-createServer() 
+if (!isTest) {
+  createServer().then(async ({ app }) =>
+    app.listen(await getPort({ port: portNumbers(3000, 3100) }), () => {
+      console.info('Client Server: http://localhost:3000')
+    }),
+  )
+}
